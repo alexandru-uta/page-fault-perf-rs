@@ -36,12 +36,16 @@ pub struct PageFaultPerfArgs {
     pub use_madv_populate: Option<bool>,
     #[arg(short, long, value_name = "USE_MEMFD")]
     pub use_memfd: Option<bool>,
+    #[arg(short, long, value_name = "USE_HUGE_PAGES")]
+    pub use_huge_pages: Option<bool>,
 }
 
 unsafe fn get_pointer_to_region_backing_fd(
     fd: i32,
     madv_populate: bool,
     use_memfd: bool,
+    use_huge_pages: bool,
+    no_threads: i32,
 ) -> *mut c_void {
     // Mmap a region backed by a file.
     let addr = mmap(
@@ -49,9 +53,15 @@ unsafe fn get_pointer_to_region_backing_fd(
         TO_WRITE,
         ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
         match fd {
-            -1 => MapFlags::MAP_ANONYMOUS | MapFlags::MAP_SHARED | MapFlags::MAP_HUGETLB,
+            -1 => match use_huge_pages {
+                true => MapFlags::MAP_ANONYMOUS | MapFlags::MAP_SHARED | MapFlags::MAP_HUGETLB,
+                false => MapFlags::MAP_ANONYMOUS | MapFlags::MAP_SHARED,
+            },
             _ => match use_memfd {
-                true => MapFlags::MAP_SHARED | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_HUGETLB,
+                true => match use_huge_pages {
+                    true => MapFlags::MAP_SHARED | MapFlags::MAP_HUGETLB,
+                    false => MapFlags::MAP_SHARED,
+                },
                 false => MapFlags::MAP_SHARED,
             },
         },
@@ -62,13 +72,33 @@ unsafe fn get_pointer_to_region_backing_fd(
 
     if madv_populate {
         let begin = time::Instant::now();
-        let ret = madvise(addr, TO_WRITE, MADV_POPULATE_WRITE);
-        match ret {
-            0 => {}
-            _ => {
-                println!("Madvise failed");
-            }
+        // Start 8 threads that perform madvise on respective portions of memory.
+        // This is done to ensure that the memory is actually allocated.
+        // transform mmap_ptr to 64 bit int.
+        let mmap_addr = addr as usize;
+        let thread_chunk = TO_WRITE / no_threads as usize;
+        let thread_vec: Vec<std::thread::JoinHandle<()>> = (0..no_threads)
+            .map(|i| {
+                let mmap_addr = mmap_addr + (i as usize * thread_chunk as usize);
+                let mmap_size = thread_chunk as usize;
+                std::thread::spawn(move || unsafe {
+                    let local_ptr = mmap_addr as *mut c_void;
+                    println!("madvise on {:?} with size {}", local_ptr, mmap_size);
+                    let ret = madvise(local_ptr, mmap_size, MADV_POPULATE_WRITE);
+                    match ret {
+                        0 => {}
+                        _ => {
+                            println!("Madvise failed");
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in thread_vec {
+            handle.join().unwrap();
         }
+
         let after = begin.elapsed();
         println!(
             "Madvise POPULATE_WRITE took {:?} ms",
@@ -150,8 +180,21 @@ fn main() {
         None => false,
     };
 
+    let use_huge_pages = match args.use_huge_pages {
+        Some(use_huge_pages) => use_huge_pages,
+        None => false,
+    };
+
     // Get pointer to the region backed by the file.
-    let addr = unsafe { get_pointer_to_region_backing_fd(fd, use_madv_populate, use_memfd) };
+    let addr = unsafe {
+        get_pointer_to_region_backing_fd(
+            fd,
+            use_madv_populate,
+            use_memfd,
+            use_huge_pages,
+            no_threads,
+        )
+    };
     let ptr_u8 = (addr as usize) as *mut u8;
 
     // Collect in an array the addresses of each page in the region.
