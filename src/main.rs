@@ -32,11 +32,16 @@ pub struct PageFaultPerfArgs {
     pub file_path: Option<String>,
     #[arg(short, long, default_value = "1", value_name = "NO_THREADS")]
     pub no_threads: Option<i32>,
-    #[arg(short, long, default_value = "false", value_name = "USE_MADV_POPULATE")]
+    #[arg(
+        short = 'p',
+        long,
+        default_value = "false",
+        value_name = "USE_MADV_POPULATE"
+    )]
     pub use_madv_populate: Option<bool>,
-    #[arg(short, long, value_name = "USE_MEMFD")]
+    #[arg(short = 'm', long, value_name = "USE_MEMFD")]
     pub use_memfd: Option<bool>,
-    #[arg(short, long, value_name = "USE_HUGE_PAGES")]
+    #[arg(short = 'l', long, value_name = "USE_HUGE_PAGES")]
     pub use_huge_pages: Option<bool>,
 }
 
