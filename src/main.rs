@@ -1,3 +1,5 @@
+#![feature(stdarch_x86_avx512)]
+
 use libc::{
     c_void, madvise, munmap, MADV_DONTNEED, MADV_HUGEPAGE, MADV_POPULATE_READ, MADV_POPULATE_WRITE,
     MADV_REMOVE, MADV_SEQUENTIAL,
@@ -43,6 +45,8 @@ pub struct PageFaultPerfArgs {
     pub use_memfd: Option<bool>,
     #[arg(short = 'l', long, value_name = "USE_HUGE_PAGES")]
     pub use_huge_pages: Option<bool>,
+    #[arg(short = 'c', long, value_name = "BENCHMARK_ONLY_MEMCPY")]
+    pub benchmark_only_memcpy: Option<bool>,
 }
 
 unsafe fn get_pointer_to_region_backing_fd(
@@ -113,9 +117,75 @@ unsafe fn get_pointer_to_region_backing_fd(
     addr
 }
 
+unsafe fn measure_memory_copy() {
+    unsafe {
+        let addr1 = get_pointer_to_region_backing_fd(-1, true, true, false, 1);
+        let addr2 = get_pointer_to_region_backing_fd(-1, true, true, false, 1);
+
+        for i in 0..TO_WRITE {
+            let addr1_ptr = addr1.offset(i as isize) as *mut u8;
+            *addr1_ptr = 143;
+        }
+
+        let begin = time::Instant::now();
+
+        // Copy page by page.
+        for i in 0..(TO_WRITE / PAGE_SIZE) {
+            let addr1_ptr = addr1.offset(i as isize * PAGE_SIZE as isize) as *mut u8;
+            let addr2_ptr = addr2.offset(i as isize * PAGE_SIZE as isize) as *mut u8;
+            //std::ptr::copy_nonoverlapping(addr1_ptr, addr2_ptr, PAGE_SIZE);
+            // libc::memcpy(
+            //     addr2_ptr as *mut c_void,
+            //     addr1_ptr as *mut c_void,
+            //     PAGE_SIZE,
+            // );
+            const STRIDE: usize = 32;
+            for j in 0..PAGE_SIZE / STRIDE {
+                //*addr2_ptr.add(j) = *addr1_ptr.add(j);
+
+                //let x = core::arch::x86_64::_mm256_load_epi64(addr1_ptr.add(j * 32) as *const i64);
+                //core::arch::x86_64::_mm256_store_epi64(addr2_ptr.add(j * 32) as *mut i64, x);
+
+                let src = addr1_ptr.add(j * STRIDE);
+                let dst = addr2_ptr.add(j * STRIDE);
+                std::arch::asm! {
+                    "prefetchnta [{src} + 256]",
+                    "vmovntdqa ymm0, ymmword ptr [{src}]",
+                    "vmovntdq ymmword ptr [{dst}], ymm0",
+                    src = in(reg) src,
+                    dst = in(reg) dst,
+                }
+            }
+        }
+        std::arch::asm! {
+            "sfence"
+        }
+
+        let time_spent = begin.elapsed().as_millis() as usize;
+        println!(
+            "Memcpy took {:?} ms, bandwidth = {:?} MB/s",
+            time_spent,
+            (TO_WRITE / 1024) as f32 / time_spent as f32
+        );
+        // for i in 0..TO_WRITE {
+        //     let addr1_ptr = addr1.offset(i as isize) as *mut u8;
+        //     let addr2_ptr = addr2.offset(i as isize) as *mut u8;
+        //     if *addr1_ptr != *addr2_ptr {
+        //         println!("Mismatch at index {}", i);
+        //         break;
+        //     }
+        // }
+    }
+}
 fn main() {
     // Parse command line arguments.
     let args = PageFaultPerfArgs::parse();
+
+    // Check if the flag for benchmarking memcpy is set.
+    if args.benchmark_only_memcpy.unwrap_or(false) {
+        unsafe { measure_memory_copy() };
+        return;
+    }
 
     // If file path is none and memfd is none, then anonymous memory is needed and fd = -1.
     // A bad combination of parameters will result in fd = -2.
