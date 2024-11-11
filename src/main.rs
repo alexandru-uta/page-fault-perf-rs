@@ -1,19 +1,11 @@
 #![feature(stdarch_x86_avx512)]
 
-use libc::{
-    c_void, madvise, munmap, MADV_DONTNEED, MADV_HUGEPAGE, MADV_POPULATE_READ, MADV_POPULATE_WRITE,
-    MADV_REMOVE, MADV_SEQUENTIAL,
-};
-
+use clap::Parser;
+use libc::{c_void, madvise, memset, MADV_HUGEPAGE, MADV_POPULATE_WRITE, MADV_SEQUENTIAL};
 use nix::sys::mman::{mmap, MapFlags, ProtFlags};
-
-use clap::{Parser, Subcommand};
-use memfd;
 use rayon::prelude::*;
-use std::env;
 use std::fs::File;
 use std::os::fd::IntoRawFd;
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::time;
 
@@ -47,6 +39,8 @@ pub struct PageFaultPerfArgs {
     pub use_huge_pages: Option<bool>,
     #[arg(short = 'c', long, value_name = "BENCHMARK_ONLY_MEMCPY")]
     pub benchmark_only_memcpy: Option<bool>,
+    #[arg(short = 't', long, value_name = "USE_TRANSPARENT_HUGE_PAGES")]
+    pub use_transparent_huge_pages: Option<bool>,
 }
 
 unsafe fn get_pointer_to_region_backing_fd(
@@ -55,9 +49,10 @@ unsafe fn get_pointer_to_region_backing_fd(
     use_memfd: bool,
     use_huge_pages: bool,
     no_threads: i32,
+    use_transparent_huge_pages: bool,
 ) -> *mut c_void {
     // Mmap a region backed by a file.
-    let addr = mmap(
+    let mut addr = mmap(
         std::ptr::null_mut(),
         TO_WRITE,
         ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
@@ -78,6 +73,23 @@ unsafe fn get_pointer_to_region_backing_fd(
         0,
     )
     .expect("Mmap failed");
+
+    println!(
+        "Address: {:?} is aligned for 2M {:?} or for 4K {:?}",
+        addr as usize,
+        (addr as usize) % (2 * MB) == 0,
+        (addr as usize) % PAGE_SIZE == 0
+    );
+
+    if use_transparent_huge_pages {
+        let ret = madvise(addr, TO_WRITE, MADV_HUGEPAGE);
+        match ret {
+            0 => {}
+            _ => {
+                println!("Madvise huge pages failed");
+            }
+        }
+    }
 
     if madv_populate {
         let begin = time::Instant::now();
@@ -117,10 +129,33 @@ unsafe fn get_pointer_to_region_backing_fd(
     addr
 }
 
+#[inline(always)]
+pub fn manual_copy_from_slice(dst: &mut [u8], src: &[u8]) {
+    if dst.len() != src.len() {
+        panic!(
+            "source and destination have different lengths: src has length {} and dst has length {}",
+            src.len(),
+            dst.len())
+    };
+    #[allow(clippy::manual_memcpy)]
+    for i in 0..dst.len() {
+        dst[i] = src[i];
+    }
+}
+
+#[inline(always)]
+pub fn fast_copy(src: *const u8, dst: *mut u8, len: usize) {
+    for i in 0..len {
+        unsafe {
+            *dst.add(i) = *src.add(i);
+        }
+    }
+}
+
 unsafe fn measure_memory_copy() {
     unsafe {
-        let addr1 = get_pointer_to_region_backing_fd(-1, true, true, false, 1);
-        let addr2 = get_pointer_to_region_backing_fd(-1, true, true, false, 1);
+        let addr1 = get_pointer_to_region_backing_fd(-1, true, true, false, 1, true);
+        let addr2 = get_pointer_to_region_backing_fd(-1, true, true, false, 1, true);
 
         for i in 0..TO_WRITE {
             let addr1_ptr = addr1.offset(i as isize) as *mut u8;
@@ -133,33 +168,42 @@ unsafe fn measure_memory_copy() {
         for i in 0..(TO_WRITE / PAGE_SIZE) {
             let addr1_ptr = addr1.offset(i as isize * PAGE_SIZE as isize) as *mut u8;
             let addr2_ptr = addr2.offset(i as isize * PAGE_SIZE as isize) as *mut u8;
+
             //std::ptr::copy_nonoverlapping(addr1_ptr, addr2_ptr, PAGE_SIZE);
+
             // libc::memcpy(
             //     addr2_ptr as *mut c_void,
             //     addr1_ptr as *mut c_void,
             //     PAGE_SIZE,
             // );
-            const STRIDE: usize = 32;
-            for j in 0..PAGE_SIZE / STRIDE {
-                //*addr2_ptr.add(j) = *addr1_ptr.add(j);
 
-                //let x = core::arch::x86_64::_mm256_load_epi64(addr1_ptr.add(j * 32) as *const i64);
-                //core::arch::x86_64::_mm256_store_epi64(addr2_ptr.add(j * 32) as *mut i64, x);
+            // for j in 0..PAGE_SIZE {
+            //     *addr2_ptr.add(j) = *addr1_ptr.add(j);
+            // }
 
-                let src = addr1_ptr.add(j * STRIDE);
-                let dst = addr2_ptr.add(j * STRIDE);
-                std::arch::asm! {
-                    "prefetchnta [{src} + 256]",
-                    "vmovntdqa ymm0, ymmword ptr [{src}]",
-                    "vmovntdq ymmword ptr [{dst}], ymm0",
-                    src = in(reg) src,
-                    dst = in(reg) dst,
-                }
-            }
+            //fast_copy(addr1_ptr, addr2_ptr, PAGE_SIZE);
+            manual_copy_from_slice(
+                std::slice::from_raw_parts_mut(addr2_ptr, PAGE_SIZE),
+                std::slice::from_raw_parts(addr1_ptr, PAGE_SIZE),
+            );
+
+            // const STRIDE: usize = 32;
+            // for j in 0..PAGE_SIZE / STRIDE {
+
+            //     let src = addr1_ptr.add(j * STRIDE);
+            //     let dst = addr2_ptr.add(j * STRIDE);
+            //     std::arch::asm! {
+            //         "prefetchnta [{src} + 256]",
+            //         "vmovntdqa ymm0, ymmword ptr [{src}]",
+            //         "vmovntdq ymmword ptr [{dst}], ymm0",
+            //         src = in(reg) src,
+            //         dst = in(reg) dst,
+            //     }
+            // }
         }
-        std::arch::asm! {
-            "sfence"
-        }
+        // std::arch::asm! {
+        //     "sfence"
+        // }
 
         let time_spent = begin.elapsed().as_millis() as usize;
         println!(
@@ -167,14 +211,14 @@ unsafe fn measure_memory_copy() {
             time_spent,
             (TO_WRITE / 1024) as f32 / time_spent as f32
         );
-        // for i in 0..TO_WRITE {
-        //     let addr1_ptr = addr1.offset(i as isize) as *mut u8;
-        //     let addr2_ptr = addr2.offset(i as isize) as *mut u8;
-        //     if *addr1_ptr != *addr2_ptr {
-        //         println!("Mismatch at index {}", i);
-        //         break;
-        //     }
-        // }
+        for i in 0..TO_WRITE {
+            let addr1_ptr = addr1.offset(i as isize) as *mut u8;
+            let addr2_ptr = addr2.offset(i as isize) as *mut u8;
+            if *addr1_ptr != *addr2_ptr {
+                println!("Mismatch at index {}", i);
+                break;
+            }
+        }
     }
 }
 fn main() {
@@ -216,7 +260,7 @@ fn main() {
         }
         (None, Some(true)) => {
             // Create an memfd file.
-            let opts = memfd::MemfdOptions::default().hugetlb(Some(memfd::HugetlbSize::Huge2MB));
+            let opts = memfd::MemfdOptions::default(); //.hugetlb(Some(memfd::HugetlbSize::Huge2MB));
             match opts.create("") {
                 Ok(memfd) => memfd.into_raw_fd(),
                 Err(e) => {
@@ -260,6 +304,11 @@ fn main() {
         None => false,
     };
 
+    let use_transparent_huge_pages = match args.use_transparent_huge_pages {
+        Some(use_transparent_huge) => use_transparent_huge,
+        None => false,
+    };
+
     // Get pointer to the region backed by the file.
     let addr = unsafe {
         get_pointer_to_region_backing_fd(
@@ -268,6 +317,7 @@ fn main() {
             use_memfd,
             use_huge_pages,
             no_threads,
+            use_transparent_huge_pages,
         )
     };
     let ptr_u8 = (addr as usize) as *mut u8;
@@ -292,6 +342,7 @@ fn main() {
             *address_ptr.add(13) += 1;
         }
     });
+
     let after = begin.elapsed();
     println!(
         "Touching all pages took {:?} ms",
