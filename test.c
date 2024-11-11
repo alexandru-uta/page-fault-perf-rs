@@ -25,8 +25,8 @@ int main(int argc, char *argv[]) {
   memset(addr, 13, LARGE_PAGE_SIZE);
 
   // Protect the region beyond WASM_PAGE_SIZE.
-  //int res = mprotect(addr + WASM_PAGE_SIZE, LARGE_PAGE_SIZE - WASM_PAGE_SIZE, PROT_NONE);
-  //printf("mprotect result: %d\n", res);
+  int res = mprotect(addr + WASM_PAGE_SIZE, LARGE_PAGE_SIZE - WASM_PAGE_SIZE, PROT_NONE);
+  printf("mprotect result: %d\n", res);
 
   // Touch a page within the protected region.
   // This should cause a segfault.
