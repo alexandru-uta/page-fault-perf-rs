@@ -7,6 +7,12 @@
 #define LARGE_PAGE_SIZE (2 * 1024 * 1024)
 #define WASM_PAGE_SIZE 65536
 
+/*
+ * This test shows that even when using transparent huge pages
+ * one can still use `mprotect()` at 4 KiB granularity rather than
+ * at 2 MiB granularity.
+ */
+
 int main(int argc, char *argv[]) {
 
   // Create an address space of 2MB.
@@ -14,7 +20,7 @@ int main(int argc, char *argv[]) {
                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 
   // Set the region to use transparent huge pages.
-  //madvise(addr, LARGE_PAGE_SIZE, MADV_HUGEPAGE);
+  madvise(addr, LARGE_PAGE_SIZE, MADV_HUGEPAGE);
   // Fill the region with some value.
   memset(addr, 13, LARGE_PAGE_SIZE);
 
